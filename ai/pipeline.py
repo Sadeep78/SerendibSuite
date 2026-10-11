@@ -89,8 +89,12 @@ def _make_recommendation(
         # eyes_status unknown / unexpected
         return ("review", "Face detected but eye status unclear. Recommend review.")
 
-    # No face — likely a landscape, venue, or detail shot.
+    # No full face — eye detail shot, landscape, venue, or macro shot.
     if not is_blurry:
+        if eyes_status == "closed":
+            return ("review", "Eye detail shot detected with closed eyes. Recommend review.")
+        if eyes_status == "open":
+            return ("keep", "Sharp image with open eyes detail shot. Recommended to keep.")
         return ("keep", "Sharp image, no face detected (landscape or detail shot). Recommended to keep.")
 
     return ("review", "Insufficient information to make a confident recommendation.")

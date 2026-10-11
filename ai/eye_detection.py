@@ -306,25 +306,7 @@ def _analyse_with_yunet(image_path: Path) -> EyeResult:
     else:
         valid_faces = []
 
-    num_faces = len(valid_faces)
-    if num_faces == 0:
-        return EyeResult(
-            face_detected=False,
-            eyes_status="no_face",
-            num_faces=0,
-            method="yunet",
-        )
-
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-    # In group photos, only evaluate prominent faces (avoid false closed flags from tiny distant background faces)
-    max_area = max(f[2] * f[3] for f in valid_faces)
-    if num_faces > 2:
-        eval_faces = [f for f in valid_faces if (f[2] * f[3] >= 0.20 * max_area) and min(f[2], f[3]) >= 20]
-        if not eval_faces:
-            eval_faces = valid_faces[:2]
-    else:
-        eval_faces = valid_faces
 
     def _is_eye_open(face, ex, ey):
         fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
@@ -358,15 +340,62 @@ def _analyse_with_yunet(image_path: Path) -> EyeResult:
         if c_min <= 25.0 and mag_x >= 24.0:
             return True
 
-        # Closed eyelid:
-        # Smooth skin, no dark pupil, low horizontal gradient
+        # Closed eyelid detection (e.g. squinting shut / blinking):
         is_closed = (
+            (ratio >= 0.80 and mag_x < 26.0) or
+            (ratio >= 0.84 and c_min > 28.0) or
+            (c_min > 40.0 and mag_x < 26.0) or
             (ratio >= 1.04 and mag_x < 28.0) or
-            (ratio >= 0.98 and mag_x < 24.0 and c_min > 28.0) or
-            (mag_x < 16.0 and c_min > 30.0) or
-            (c_min > 55.0 and mag_x < 26.0)
+            (mag_x < 16.0 and c_min > 28.0)
         )
         return not is_closed
+
+    num_faces = len(valid_faces)
+    if num_faces == 0:
+        # Check if cropped/partial face has valid eye landmarks in bounds (e.g. eye macro crop)
+        eye_face = None
+        if faces is not None:
+            margin = 2
+            for f in faces:
+                rex, rey = f[4], f[5]
+                lex, ley = f[6], f[7]
+                if margin <= rex < (w - margin) and margin <= rey < (h - margin) and \
+                   margin <= lex < (w - margin) and margin <= ley < (h - margin) and f[14] >= 0.5:
+                    eye_face = f
+                    break
+
+        if eye_face is not None:
+            r_open = _is_eye_open(eye_face, int(eye_face[4]), int(eye_face[5]))
+            l_open = _is_eye_open(eye_face, int(eye_face[6]), int(eye_face[7]))
+            if r_open and l_open:
+                eyes_status = "open"
+            elif not r_open and not l_open:
+                eyes_status = "closed"
+            else:
+                eyes_status = "partial"
+
+            return EyeResult(
+                face_detected=False,  # Full face is None as requested
+                eyes_status=eyes_status,
+                num_faces=0,
+                method="yunet",
+            )
+
+        return EyeResult(
+            face_detected=False,
+            eyes_status="no_face",
+            num_faces=0,
+            method="yunet",
+        )
+
+    # In group photos, only evaluate prominent faces (avoid false closed flags from tiny distant background faces)
+    max_area = max(f[2] * f[3] for f in valid_faces)
+    if num_faces > 4:
+        eval_faces = [f for f in valid_faces if (f[2] * f[3] >= 0.20 * max_area) and min(f[2], f[3]) >= 20]
+        if not eval_faces:
+            eval_faces = valid_faces[:4]
+    else:
+        eval_faces = valid_faces
 
     face_results = []
     for face in eval_faces:
@@ -389,6 +418,7 @@ def _analyse_with_yunet(image_path: Path) -> EyeResult:
     num_partial = face_results.count("partial")
 
     if num_eval <= 4:
+        # Solo, couple, or family group: if ANY face has closed eyes, status is closed
         if num_closed > 0:
             eyes_status = "closed"
         elif num_partial > 0:
@@ -396,7 +426,7 @@ def _analyse_with_yunet(image_path: Path) -> EyeResult:
         else:
             eyes_status = "open"
     else:
-        # Group shot: if majority have open eyes, photo is open
+        # Large crowd shot: if majority have open eyes, photo is open
         if (num_open / num_eval) >= 0.70:
             eyes_status = "open"
         elif (num_closed / num_eval) >= 0.40:
