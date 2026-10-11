@@ -212,27 +212,38 @@ def _analyse_with_mediapipe(image_path: Path) -> EyeResult:
             method="mediapipe",
         )
 
-    # In couple & group wedding photos, ALL detected faces must have both eyes open.
-    # If ANY face has closed eyes (blinked), status is "closed".
-    # If ANY face has one eye closed (partial) and none fully closed, status is "partial".
-    has_closed = False
-    has_partial = False
-
+    face_results = []
     for landmarks in valid_face_landmarks:
         left_ear  = _ear(landmarks, _LEFT_EYE_INDICES,  w, h)
         right_ear = _ear(landmarks, _RIGHT_EYE_INDICES, w, h)
 
         if left_ear < EAR_OPEN_THRESHOLD and right_ear < EAR_OPEN_THRESHOLD:
-            has_closed = True
+            face_results.append("closed")
         elif left_ear < EAR_OPEN_THRESHOLD or right_ear < EAR_OPEN_THRESHOLD:
-            has_partial = True
+            face_results.append("partial")
+        else:
+            face_results.append("open")
 
-    if has_closed:
-        eyes_status = "closed"
-    elif has_partial:
-        eyes_status = "partial"
+    num_eval = len(face_results)
+    num_open = face_results.count("open")
+    num_closed = face_results.count("closed")
+    num_partial = face_results.count("partial")
+
+    if num_eval <= 4:
+        if num_closed > 0:
+            eyes_status = "closed"
+        elif num_partial > 0:
+            eyes_status = "partial"
+        else:
+            eyes_status = "open"
     else:
-        eyes_status = "open"
+        # Group shot: if majority have open eyes, photo is open
+        if (num_open / num_eval) >= 0.70:
+            eyes_status = "open"
+        elif (num_closed / num_eval) >= 0.40:
+            eyes_status = "closed"
+        else:
+            eyes_status = "partial"
 
     return EyeResult(
         face_detected=True,
@@ -305,68 +316,93 @@ def _analyse_with_yunet(image_path: Path) -> EyeResult:
         )
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    has_closed = False
-    has_partial = False
 
-    for face in valid_faces:
+    # In group photos, only evaluate prominent faces (avoid false closed flags from tiny distant background faces)
+    max_area = max(f[2] * f[3] for f in valid_faces)
+    if num_faces > 2:
+        eval_faces = [f for f in valid_faces if (f[2] * f[3] >= 0.20 * max_area) and min(f[2], f[3]) >= 20]
+        if not eval_faces:
+            eval_faces = valid_faces[:2]
+    else:
+        eval_faces = valid_faces
+
+    def _is_eye_open(face, ex, ey):
         fx, fy, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
-        # Sample cheek skin tone for comparison with eye center
-        cheek = gray[max(0, fy + int(fh * 0.55)):min(h, fy + int(fh * 0.75)),
-                     max(0, fx + int(fw * 0.25)):min(w, fx + int(fw * 0.75))]
-        skin_med = float(np.median(cheek)) if cheek.size > 0 else 128.0
+        # Sample skin from upper face/forehead
+        forehead = gray[max(0, fy + int(fh * 0.15)):min(h, fy + int(fh * 0.30)),
+                        max(0, fx + int(fw * 0.25)):min(w, fx + int(fw * 0.75))]
+        skin_med = float(np.median(forehead)) if forehead.size > 0 else 128.0
+        if skin_med < 50.0 or skin_med > 230.0:
+            face_roi = gray[max(0, fy):min(h, fy + fh), max(0, fx):min(w, fx + fw)]
+            skin_med = float(np.median(face_roi)) if face_roi.size > 0 else 128.0
 
-        eye_rw = max(8, int(fw * 0.10))
-        eye_rh = max(6, int(fh * 0.08))
+        eye_rw = max(6, int(fw * 0.10))
+        eye_rh = max(5, int(fh * 0.08))
 
-        def _is_eye_open(ex, ey):
-            patch = gray[max(0, ey - eye_rh):min(h, ey + eye_rh),
-                         max(0, ex - eye_rw):min(w, ex + eye_rw)]
-            if patch.size == 0:
-                return True
-            ch, cw = patch.shape
-            center = patch[int(ch * 0.25):int(ch * 0.75), int(cw * 0.25):int(cw * 0.75)]
-            if center.size == 0:
-                return True
+        patch = gray[max(0, ey - eye_rh):min(h, ey + eye_rh),
+                     max(0, ex - eye_rw):min(w, ex + eye_rw)]
+        if patch.size == 0:
+            return True
+        ch, cw = patch.shape
+        center = patch[int(ch * 0.25):int(ch * 0.75), int(cw * 0.25):int(cw * 0.75)]
+        if center.size == 0:
+            return True
 
-            c_mean = float(np.mean(center))
-            c_min = float(np.min(center))
-            sobelx = cv2.Sobel(patch, cv2.CV_64F, 1, 0, ksize=3)
-            mag_x = float(np.mean(np.abs(sobelx)))
-            center_skin_ratio = c_mean / (skin_med + 1e-5)
+        c_mean = float(np.mean(center))
+        c_min = float(np.min(center))
+        sobelx = cv2.Sobel(patch, cv2.CV_64F, 1, 0, ksize=3)
+        mag_x = float(np.mean(np.abs(sobelx)))
+        ratio = c_mean / (skin_med + 1e-5)
 
-            # An eye is closed/squinting shut if:
-            # 1. Center intensity is as light as or lighter than face skin and lacks horizontal iris gradient
-            # 2. Or center skin ratio >= 1.03 (smooth eyelid skin)
-            # 3. Or horizontal gradient is very low and minimum pixel is not dark (no dark pupil)
-            # 4. Or minimum pixel in center is not dark (> 35.0)
-            is_closed = (
-                (center_skin_ratio >= 0.98 and mag_x < 26.0) or
-                (center_skin_ratio >= 1.03) or
-                (mag_x < 18.0 and c_min > 25.0) or
-                (c_min > 35.0 and mag_x < 28.0)
-            )
-            return not is_closed
+        # Clear open eye: deep dark pupil + sharp contrast
+        if c_min <= 25.0 and mag_x >= 24.0:
+            return True
 
+        # Closed eyelid:
+        # Smooth skin, no dark pupil, low horizontal gradient
+        is_closed = (
+            (ratio >= 1.04 and mag_x < 28.0) or
+            (ratio >= 0.98 and mag_x < 24.0 and c_min > 28.0) or
+            (mag_x < 16.0 and c_min > 30.0) or
+            (c_min > 55.0 and mag_x < 26.0)
+        )
+        return not is_closed
+
+    face_results = []
+    for face in eval_faces:
         rex, rey = int(face[4]), int(face[5])
         lex, ley = int(face[6]), int(face[7])
 
-        r_open = _is_eye_open(rex, rey)
-        l_open = _is_eye_open(lex, ley)
+        r_open = _is_eye_open(face, rex, rey)
+        l_open = _is_eye_open(face, lex, ley)
 
-        if not r_open and not l_open:
-            has_closed = True
-        elif not r_open or not l_open:
-            has_partial = True
+        if r_open and l_open:
+            face_results.append("open")
+        elif not r_open and not l_open:
+            face_results.append("closed")
+        else:
+            face_results.append("partial")
 
-    # In couple & group photos, ALL detected faces must have both eyes open.
-    # If ANY face has closed eyes (blinked), status is "closed".
-    # If ANY face has one eye closed (partial) and none fully closed, status is "partial".
-    if has_closed:
-        eyes_status = "closed"
-    elif has_partial:
-        eyes_status = "partial"
+    num_eval = len(face_results)
+    num_open = face_results.count("open")
+    num_closed = face_results.count("closed")
+    num_partial = face_results.count("partial")
+
+    if num_eval <= 4:
+        if num_closed > 0:
+            eyes_status = "closed"
+        elif num_partial > 0:
+            eyes_status = "partial"
+        else:
+            eyes_status = "open"
     else:
-        eyes_status = "open"
+        # Group shot: if majority have open eyes, photo is open
+        if (num_open / num_eval) >= 0.70:
+            eyes_status = "open"
+        elif (num_closed / num_eval) >= 0.40:
+            eyes_status = "closed"
+        else:
+            eyes_status = "partial"
 
     return EyeResult(
         face_detected=True,
